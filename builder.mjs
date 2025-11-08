@@ -1,6 +1,5 @@
 import { existsSync, mkdirSync, renameSync, readdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
-
 /*
 npm update -g esbuild
 npm unlink esbuild
@@ -128,13 +127,13 @@ export const buildFn = async opts => {
 			keepNames,
 			minify
 		});
-		console.log('✅ Built', dest);
+		console.log('✅: Built', dest);
 		return {
 			success: true,
 			outfile: dest
 		};
 	} catch (exception) {
-		console.error('❌ Build', exception);
+		console.error('❌: Build', exception);
 		throw exception;
 	}
 };
