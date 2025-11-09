@@ -1,14 +1,37 @@
 import { readdir, stat, writeFile, readFile } from 'fs/promises';
 import { join, extname, relative, basename } from 'path';
 
+/**
+ * @typedef {object} CacheEntry
+ * @property {Promise<any>} promise - The promise representing the ongoing fetch operation.
+ * @property {AbortController} controller - The AbortController associated with the operation.
+ */
+
+/**
+ * A cache implementation that stores promises and their corresponding AbortControllers.
+ * @template K - The type of the key.
+ * @template V - The type of the value resolved by the fetch function.
+ */
 // prettier-ignore
 class AbortableCache {
+	/** @type {(key: K, signal: AbortSignal) => Promise<V>} */
 	#fetch;
+	/** @type {Map<K, CacheEntry>} */
 	#cache;
+	/**
+	 * @param {(key: K, signal: AbortSignal) => Promise<V>} fn - The function to call when a cache miss occurs. 
+	 * It must accept the key and an AbortSignal.
+	 */
 	constructor(fn) {
 		this.#fetch = fn;
 		this.#cache = new Map();
 	}
+	/**
+	 * Gets the value associated with the key. If the key is not in the cache, 
+	 * it calls the fetch function and stores the resulting Promise and AbortController.
+	 * @param {K} key - The key to look up.
+	 * @returns {Promise<V>} The promise for the requested value.
+	 */
 	get(key) {
 		const m = this.#cache;
 		if (m.has(key)) {
@@ -22,6 +45,9 @@ class AbortableCache {
 		});
 		return p;
 	}
+	/**
+	 * Aborts all ongoing fetch operations and clears the entire cache.
+	 */
 	clear() {
 		const m = this.#cache;
 		for (const o of m.values()) {
@@ -56,6 +82,27 @@ class AbortableCache {
 	*/
 }
 
+/**
+ * @typedef {object} ImportMapOptions
+ * @property {string} [output] - Optional path to write the generated import map JSON file.
+ * @property {string[]} [excludedPatterns] - An array of strings used to exclude files or directories if their path or name includes any of these patterns.
+ * @property {string[]} [includedExtensions] - An array of file extensions (e.g., 'js', '.mjs') to include in the map. Defaults to ['mjs', 'js'].
+ * @property {number} [maxDepth] - The maximum directory depth to scan. Defaults to 10000.
+ */
+
+/**
+ * @typedef {object} ImportMap
+ * @property {Record<string, string>} imports - The generated mapping of specifiers to relative paths.
+ */
+
+/**
+ * Scans a directory recursively to generate an Import Map object (specifiers -> relative paths).
+ * It respects 'package.json' `main` and `exports` fields for directory imports.
+ * @param {string} rootDir - The root directory to start scanning from.
+ * @param {ImportMapOptions} [options] - Configuration options for the import map generation.
+ * @returns {Promise<Record<string, string>>} A promise that resolves to the generated import map data (the 'imports' object content).
+ * @throws {Error} If `rootDir` does not exist or is not a directory.
+ */
 // prettier-ignore
 export const generateImportMapFromDir = async (rootDir, options) => {
 	const rootStats = await stat(rootDir).catch(e => {
@@ -67,6 +114,7 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 	if (!rootStats.isDirectory()) {
 		throw new Error(`Path is not a directory: ${rootDir}`);
 	}
+	/** @type {[AbortableCache<string, import('fs').Stats | null>, AbortableCache<string, string[] | []>]} */
 	const [
 		statsCache,
 		dirCache
@@ -90,9 +138,11 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 			)
 		)
 	);
+	/** @type {ImportMapOptions} */
 	options ||= {};
 	const excludedPatterns = options.excludedPatterns?.filter(Boolean) || [];
 	const hasExclusions = 0 < excludedPatterns.length;
+	/** @type {Set<string>} */
 	const includedExtensions = new Set(
 		(
 			(
@@ -111,11 +161,19 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 			)
 		)
 	);
+	/** @type {(path: string) => string} */
 	const relativeToRootDir = path => relative(rootDir, path).replaceAll('\\', '/');
+	/** @type {Record<string, string>} */
 	const data = {};
+	/** @type {Set<string>} */
 	const scanned = new Set();
 	const maxLimit = 1e4;
 	const depthMax = options.maxDepth ? Math.max(1, Math.min(maxLimit, options.maxDepth)) : maxLimit;
+	/**
+	 * Attempts to resolve an export value from a package exports object based on common conventions.
+	 * @param {object} x - The exports object or condition value.
+	 * @returns {string | null} The resolved export path or null.
+	 */
 	const resolveExport = x => (
 		x.default ||
 		x.browser ||
@@ -123,12 +181,19 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 		x.node ||
 		Object.values(x)[0]
 	);
+	/**
+	 * Recursively scans a directory.
+	 * @param {string} dir - The current directory path.
+	 * @param {number} [depth=0] - The current recursion depth.
+	 * @returns {Promise<boolean | undefined>} A promise that resolves to `true` if the directory or its subdirectories contain files that were mapped, otherwise `false` or `undefined`.
+	 */
 	const scan = async (dir, depth = 0) => {
 		if (
 			depthMax > depth &&
 			!scanned.has(dir)
 		) {
 			scanned.add(dir);
+			/** @type {Promise<({fullPath: string, relPath: string, stats: import('fs').Stats, item: string} | null)[]>} */
 			const statPromises = [];
 			for (const item of await dirCache.get(dir)) {
 				if (item.startsWith('.')) {
@@ -157,8 +222,10 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 						})
 				);
 			}
+			/** @type {{main?: string, exports?: string | Record<string, any>} | null} */
 			let pkg = null;
 			let hasFiles = false;
+			/** @type {(Promise<boolean | undefined>)[]} */
 			const subDirPromises = [];
 			for (const result of (await Promise.all(statPromises)).filter(Boolean)) {
 				const { item, fullPath, relPath, stats } = result;
@@ -199,6 +266,7 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 			let hasContent = hasFiles || hasSubDirs;
 			const dirRelPath = relativeToRootDir(dir);
 			if (dirRelPath && pkg) {
+				/** @type {(e: string) => string} */
 				const toNorm = e => `./${join(dirRelPath, e).replaceAll('\\', '/')}`;
 				if (pkg.main) {
 					data[dirRelPath] ||= (
@@ -230,8 +298,10 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 										'./' === subpath[0] &&
 										'./' !== subpath
 									) {
+										/** @type {string | Record<string, any> | undefined} */
 										let subValue = pe[subpath];
 										if (subValue) {
+											/** @type {string | null} */
 											let subResolved = null;
 											switch (typeof subValue) {
 												case 'string':
