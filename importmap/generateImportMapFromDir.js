@@ -1,4 +1,4 @@
-import { readdir, stat, writeFile, readFile } from 'fs/promises';
+import { readdir, stat, writeFile, readFile, realpath } from 'fs/promises';
 import { join, extname, relative, basename } from 'path';
 
 /**
@@ -19,7 +19,7 @@ class AbortableCache {
 	/** @type {Map<K, CacheEntry>} */
 	#cache;
 	/**
-	 * @param {(key: K, signal: AbortSignal) => Promise<V>} fn - The function to call when a cache miss occurs. 
+	 * @param {(key: K, signal: AbortSignal) => Promise<V>} fn - The function to call when a cache miss occurs.
 	 * It must accept the key and an AbortSignal.
 	 */
 	constructor(fn) {
@@ -27,7 +27,7 @@ class AbortableCache {
 		this.#cache = new Map();
 	}
 	/**
-	 * Gets the value associated with the key. If the key is not in the cache, 
+	 * Gets the value associated with the key. If the key is not in the cache,
 	 * it calls the fetch function and stores the resulting Promise and AbortController.
 	 * @param {K} key - The key to look up.
 	 * @returns {Promise<V>} The promise for the requested value.
@@ -83,6 +83,43 @@ class AbortableCache {
 }
 
 /**
+ * Attempts to resolve an export value from a package exports object based on common conventions.
+ * Recursively handles nested conditions to ensure string resolution.
+ * @param {object} x - The exports object or condition value.
+ * @param {number} [depth=0] - Recursion depth (internal).
+ * @returns {string | null} The resolved export path or null.
+ */
+const resolveExport = (x, depth = 0) => {
+	if (x && 10 > depth) {
+		let e;
+		if (
+			'string' === typeof (e=x.default) ||
+			'string' === typeof (e=x.browser) ||
+			'string' === typeof (e=x.import) ||
+			'string' === typeof (e=x.node)
+		) {
+			return e;
+		}
+		for (const key of Object.keys(x).sort()) {
+			const v = x[key];
+			if (v) {
+				const t = typeof v;
+				if ('string' === t) {
+					return v;
+				}
+				if ('object' === t) {
+					const r = resolveExport(v, depth + 1);
+					if ('string' === typeof r) {
+						return r;
+					}
+				}
+			}
+		}
+	}
+	return null;
+};
+
+/**
  * @typedef {object} ImportMapOptions
  * @property {string} [output] - Optional path to write the generated import map JSON file.
  * @property {string[]} [excludedPatterns] - An array of strings used to exclude files or directories if their path or name includes any of these patterns.
@@ -114,19 +151,6 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 	if (!rootStats.isDirectory()) {
 		throw new Error(`Path is not a directory: ${rootDir}`);
 	}
-	// Helper for resolving exports conditional object
-	/**
-	 * Attempts to resolve an export value from a package exports object based on common conventions.
-	 * @param {object} x - The exports object or condition value.
-	 * @returns {string | null} The resolved export path or null.
-	 */
-	const resolveExport = x => (
-		x.default ||
-		x.browser ||
-		x.import ||
-		x.node ||
-		Object.values(x)[0]
-	);
 	/** @type {[AbortableCache<string, import('fs').Stats | null>, AbortableCache<string, string[] | []>]} */
 	const [
 		statsCache,
@@ -147,7 +171,17 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 					signal: s
 				}
 			).catch(
-				() => a()
+				err => {
+					switch(err.code) {
+						case 'EACCES':
+						case 'EPERM':
+							console.warn(`Permission denied: ${k}`); // fall
+						case 'ENOENT':
+							return a();
+						default:
+							throw err; // propagate unexpected
+					}
+				}
 			)
 		)
 	);
@@ -189,105 +223,77 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 	 * @returns {Promise<boolean | undefined>} A promise that resolves to `true` if the directory or its subdirectories contain files that were mapped, otherwise `false` or `undefined`.
 	 */
 	const scan = async (dir, depth = 0) => {
-		if (
-			depthMax >= depth &&
-			!scanned.has(dir)
-		) {
-			scanned.add(dir);
-			/** @type {Promise<({fullPath: string, relPath: string, stats: import('fs').Stats, item: string} | null)[]>} */
-			const statPromises = [];
-			for (const item of await dirCache.get(dir)) {
-				if (item.startsWith('.')) {
-					continue;
-				}
-				const fullPath = join(dir, item);
-				const relPath = relativeToRootDir(fullPath);
-				if (
-					hasExclusions &&
-					excludedPatterns.some(
-						pattern =>
-							item.includes(pattern) ||
-							relPath.includes(pattern)
-					)
-				) {
-					continue;
-				}
-				statPromises.push(
-					statsCache
-						.get(fullPath)
-						.then(stats => stats && {
-							fullPath,
-							relPath,
-							stats,
-							item
-						})
-				);
+		if (depth > depthMax) {
+			return false;
+		}
+		const canonicalDir = await realpath(dir).catch(() => dir);
+		if (scanned.has(canonicalDir)) {
+			return false;
+		}
+		/** @type {Promise<({fullPath: string, relPath: string, stats: import('fs').Stats, item: string} | null)[]>} */
+		const statPromises = [];
+		for (const item of await dirCache.get(dir)) {
+			if (item.startsWith('.')) {
+				continue;
 			}
-			/** @type {{main?: string, exports?: string | Record<string, any>} | null} */
-			let pkg = null;
-			let hasFiles = false;
-			/** @type {(Promise<boolean | undefined>)[]} */
-			const subDirPromises = [];
-			for (const result of (await Promise.all(statPromises)).filter(Boolean)) {
-				const { item, fullPath, relPath, stats } = result;
-				if (stats.isFile()) {
-					if ('package.json' === item) {
-						try {
-							pkg = JSON.parse(await readFile(fullPath, 'utf8'));
-						} catch (exception) {
-							console.error(exception);
-							console.debug(fullPath);
-						}
-						continue;
-					}
-					const itemExtension = extname(item);
-					if (includedExtensions.has(itemExtension)) {
-						const specifier = relPath.slice(0, -itemExtension.length);
-						data[specifier] ||= `./${relPath}`;
-						if ('index' === basename(item, itemExtension)) {
-							const dirPath = relPath.slice(0, -item.length);
-							if (dirPath) {
-								data[
-									'/' === dirPath.slice(-1)
-										? dirPath.slice(0, -1)
-										: dirPath
-								] ||= `./${
-									relPath
-								}`;
-							}
-						}
-						hasFiles = true;
-					}
-				} else if (stats.isDirectory()) {
-					subDirPromises.push(scan(fullPath, depth + 1));
-				}
+			const fullPath = join(dir, item);
+			const relPath = relativeToRootDir(fullPath);
+			if (
+				hasExclusions &&
+				excludedPatterns.some(
+					pattern =>
+						item.includes(pattern) ||
+						relPath.includes(pattern)
+				)
+			) {
+				continue;
 			}
-			const hasSubDirs = (await Promise.all(subDirPromises)).some(Boolean);
-			let hasContent = hasFiles || hasSubDirs;
-			const dirRelPath = relativeToRootDir(dir);
-			if (dirRelPath && pkg) {
-				/** @type {(e: string) => string} */
+			statPromises.push(
+				statsCache
+					.get(fullPath)
+					.then(stats => stats && {
+						fullPath,
+						relPath,
+						stats,
+						item
+					})
+			);
+		}
+		// Process package.json FIRST to establish explicit mappings (overrides implicit index)
+		let explicitMapping = null;
+		let hasFiles = false;
+		let hasContent = false;
+		const allStatResults = await Promise.all(statPromises);
+		const pkgResult = allStatResults.find(r => r?.item === 'package.json');
+		const dirRelPath = relativeToRootDir(dir);
+		if (pkgResult && dirRelPath) {
+			const { fullPath } = pkgResult;
+			try {
+				const pkg = JSON.parse(await readFile(fullPath, 'utf8'));
 				const toNorm = e => `./${join(dirRelPath, e).replaceAll('\\', '/')}`;
-				if (pkg.main) {
-					data[dirRelPath] ||= (
-						hasContent = true,
-						toNorm(pkg.main)
-					);
+				const pm = pkg.main;
+				if (pm) {
+					const mainStats = await statsCache.get(join(dir, pm));
+					if (mainStats?.isFile()) {
+						data[dirRelPath] = explicitMapping = toNorm(pm);
+						hasContent = true;
+					}
 				}
 				const pe = pkg.exports;
 				if (pe) {
 					let rootExport = pe;
 					if ('string' !== typeof pe) {
-						rootExport = pe['.'] || pe;
+						rootExport = pe[''] || pe['.'] || pe;
 						if ('object' === typeof rootExport) {
 							rootExport = resolveExport(rootExport);
 						}
 					}
 					if ('string' === typeof rootExport) {
-						data[dirRelPath] ||= (
-							hasContent = true,
-							toNorm(rootExport)
-						);
+						const exportStats = await statsCache.get(join(dir, rootExport));
+						if (exportStats?.isFile()) {
+							data[dirRelPath] = explicitMapping = toNorm(rootExport);
+							hasContent = true;
+						}
 					}
 					if ('object' === typeof pe) {
 						for (const subpath in pe) {
@@ -295,45 +301,71 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 								'./' === subpath.slice(0, 2) &&
 								'./' !== subpath
 							) {
-								/**  @type {string | Record<string, any> | undefined} */
 								const subValue = pe[subpath];
 								if (subValue) {
-									/** @type {string | null}*/
-									let subResolved = null;
-									if (subValue) {
-										const t = typeof subValue;
-										if ('string' === t) {
-											subResolved = subValue;
-										} else if ('object' === t) {
-											subResolved = resolveExport(subValue);
-										}										
-									}
+									const t = typeof subValue;
+									const subResolved =
+										'string' === t
+											? subValue
+											: 'object' === t
+												? resolveExport(subValue)
+												: null;
 									if (subResolved) {
-										data[
-											dirRelPath +
-											subpath.slice(1)
-										] ||= (
-											hasContent = true,
-											toNorm(subResolved)
-										);
+										const subStats = await statsCache.get(join(dir, subResolved));
+										if (subStats?.isFile()) {
+											data[dirRelPath + subpath.slice(1)] = toNorm(subResolved);
+											hasContent = true;
+										}
 									}
 								}
 							}
 						}
 					}
 				}
+			} catch (exception) {
+				console.error(exception);
+				console.debug(fullPath);
 			}
-			if (hasContent) {
-				if (dirRelPath) {
-					data[`${dirRelPath}/`] ||= `./${dirRelPath}/`;
-				} else {
-					data['./'] = './';
-				}
-			}
-			return hasContent;
-		} else {
-			return false;
 		}
+		// Now process other files (implicit index only if no explicit mapping)
+		/** @type {(Promise<boolean | undefined>)[]} */
+		const subDirPromises = [];
+		for (const result of allStatResults.filter(Boolean)) {
+			const { item, fullPath, relPath, stats } = result;
+			if (stats.isFile()) {
+				if ('package.json' === item) {
+					continue;
+				}
+				const itemExtension = extname(item);
+				if (includedExtensions.has(itemExtension)) {
+					const specifier = relPath.slice(0, -itemExtension.length);
+					data[specifier] ||= `./${relPath}`;
+					if ('index' === basename(item, itemExtension) && !explicitMapping) {
+						const dirPath = relPath.slice(0, -item.length);
+						if (dirPath) {
+							data[
+								'/' === dirPath.slice(-1)
+									? dirPath.slice(0, -1)
+									: dirPath
+							] ||= `./${relPath}`;
+						}
+					}
+					hasFiles = true;
+				}
+			} else if (stats.isDirectory()) {
+				subDirPromises.push(scan(fullPath, depth + 1).catch(() => false));
+			}
+		}
+		const hasSubDirs = (await Promise.all(subDirPromises)).some(Boolean);
+		hasContent = hasContent || hasFiles || hasSubDirs;
+		// Always map trailing slash for scanned dirs (force set for consistency)
+		if (dirRelPath) {
+			data[`${dirRelPath}/`] = `./${dirRelPath}/`;
+		} else {
+			data['./'] = './';
+		}
+		scanned.add(canonicalDir);
+		return hasContent;
 	};
 	await scan(rootDir, 0);
 	scanned.clear();
