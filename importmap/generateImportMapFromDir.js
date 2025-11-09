@@ -114,6 +114,19 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 	if (!rootStats.isDirectory()) {
 		throw new Error(`Path is not a directory: ${rootDir}`);
 	}
+	// Helper for resolving exports conditional object
+	/**
+	 * Attempts to resolve an export value from a package exports object based on common conventions.
+	 * @param {object} x - The exports object or condition value.
+	 * @returns {string | null} The resolved export path or null.
+	 */
+	const resolveExport = x => (
+		x.default ||
+		x.browser ||
+		x.import ||
+		x.node ||
+		Object.values(x)[0]
+	);
 	/** @type {[AbortableCache<string, import('fs').Stats | null>, AbortableCache<string, string[] | []>]} */
 	const [
 		statsCache,
@@ -155,7 +168,7 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 			]
 		).map(
 			ext => (
-				ext.startsWith('.')
+				'.' === ext[0]
 					? ext
 					: `.${ext}`
 			)
@@ -170,18 +183,6 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 	const maxLimit = 1e4;
 	const depthMax = options.maxDepth ? Math.max(1, Math.min(maxLimit, options.maxDepth)) : maxLimit;
 	/**
-	 * Attempts to resolve an export value from a package exports object based on common conventions.
-	 * @param {object} x - The exports object or condition value.
-	 * @returns {string | null} The resolved export path or null.
-	 */
-	const resolveExport = x => (
-		x.default ||
-		x.browser ||
-		x.import ||
-		x.node ||
-		Object.values(x)[0]
-	);
-	/**
 	 * Recursively scans a directory.
 	 * @param {string} dir - The current directory path.
 	 * @param {number} [depth=0] - The current recursion depth.
@@ -189,7 +190,7 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 	 */
 	const scan = async (dir, depth = 0) => {
 		if (
-			depthMax > depth &&
+			depthMax >= depth &&
 			!scanned.has(dir)
 		) {
 			scanned.add(dir);
@@ -247,7 +248,7 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 							const dirPath = relPath.slice(0, -item.length);
 							if (dirPath) {
 								data[
-									dirPath.endsWith('/')
+									'/' === dirPath.slice(-1)
 										? dirPath.slice(0, -1)
 										: dirPath
 								] ||= `./${
@@ -258,8 +259,7 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 						hasFiles = true;
 					}
 				} else if (stats.isDirectory()) {
-					const e = scan(fullPath, depth + 1)
-					e && subDirPromises.push(e);
+					subDirPromises.push(scan(fullPath, depth + 1));
 				}
 			}
 			const hasSubDirs = (await Promise.all(subDirPromises)).some(Boolean);
@@ -276,54 +276,49 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 				}
 				const pe = pkg.exports;
 				if (pe) {
-					let resolved = pe;
+					let rootExport = pe;
 					if ('string' !== typeof pe) {
-						const value = resolved = pe['.'] || pe;
-						if (value && 'object' === typeof value) {
-							resolved = resolveExport(value);
+						rootExport = pe['.'] || pe;
+						if ('object' === typeof rootExport) {
+							rootExport = resolveExport(rootExport);
 						}
 					}
-					if (resolved) {
-						switch (typeof resolved) {
-							case 'string':
-								data[dirRelPath] ||= (
-									hasContent = true,
-									toNorm(resolved)
-								);
-								break;
-							case 'object':
-								for (const subpath in resolved) {
-									if (
-										subpath &&
-										'./' === subpath[0] &&
-										'./' !== subpath
-									) {
-										/** @type {string | Record<string, any> | undefined} */
-										let subValue = pe[subpath];
-										if (subValue) {
-											/** @type {string | null} */
-											let subResolved = null;
-											switch (typeof subValue) {
-												case 'string':
-													subResolved = subValue;
-													break;
-												case 'object':
-													subResolved = resolveExport(subValue);
-													break;
-											}
-											if (subResolved) {
-												data[
-													dirRelPath +
-													subpath.slice(1)
-												] ||= (
-													hasContent = true,
-													toNorm(subResolved)
-												);
-											}
-										}
+					if ('string' === typeof rootExport) {
+						data[dirRelPath] ||= (
+							hasContent = true,
+							toNorm(rootExport)
+						);
+					}
+					if ('object' === typeof pe) {
+						for (const subpath in pe) {
+							if (
+								'./' === subpath.slice(0, 2) &&
+								'./' !== subpath
+							) {
+								/**  @type {string | Record<string, any> | undefined} */
+								const subValue = pe[subpath];
+								if (subValue) {
+									/** @type {string | null}*/
+									let subResolved = null;
+									if (subValue) {
+										const t = typeof subValue;
+										if ('string' === t) {
+											subResolved = subValue;
+										} else if ('object' === t) {
+											subResolved = resolveExport(subValue);
+										}										
+									}
+									if (subResolved) {
+										data[
+											dirRelPath +
+											subpath.slice(1)
+										] ||= (
+											hasContent = true,
+											toNorm(subResolved)
+										);
 									}
 								}
-								break;
+							}
 						}
 					}
 				}
@@ -336,6 +331,8 @@ export const generateImportMapFromDir = async (rootDir, options) => {
 				}
 			}
 			return hasContent;
+		} else {
+			return false;
 		}
 	};
 	await scan(rootDir, 0);
